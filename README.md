@@ -1,6 +1,18 @@
 # deepseek-cli
 
 Headless CLI for [DeepSeek Chat](https://chat.deepseek.com). Works on Linux, macOS, and Windows.
+Use DeepSeek from the terminal for **headless environments** (servers, SSH, containers).
+
+Perfect for:
+- Linux servers without display
+- Remote development environments  
+- SSH sessions
+- Shell scripting
+- Automation workflows
+
+NOT for:
+- Bypassing
+- Scraping
 
 **Two modes:**
 - **TUI mode** — Interactive chat with slash commands, header bar, formatted output
