@@ -30,7 +30,7 @@ if platform.system() == "Windows":
     nest_asyncio.apply()
 
 try:
-    from playwright.async_api import async_playwright, BrowserContext, Page
+    from playwright.async_api import async_playwright, BrowserContext, Page, TimeoutError as PWTimeout
     from rich.console import Console
     from rich.markdown import Markdown
     from rich.panel import Panel
@@ -96,13 +96,11 @@ class Cfg:
 class DeepSeekCLI:
     BASE_URL = "https://chat.deepseek.com"
 
-    # --- Login page ---
+    # Login page
     SEL_SOCIAL_BTNS = ".ds-sign-in-form__social-button"
-    SEL_EMAIL_INP = 'input[type="text"].ds-input__input'
-    SEL_PW_INP = 'input[type="password"].ds-input__input'
     SEL_LOGIN_BTN = ".ds-basic-button--primary"
 
-    # --- Chat page ---
+    # Chat page
     SEL_NEW_CHAT = 'a[href="/"]'
     SEL_TEXTAREA = "textarea"
     SEL_TOGGLE = ".ds-toggle-button"
@@ -116,10 +114,29 @@ class DeepSeekCLI:
         self.chat_id: str = ""
         self._pw = None
 
+    # -- Safe navigation: catches timeouts and all Playwright errors --
+    async def _safe_goto(self, url: str, timeout: int = 30_000) -> bool:
+        """Navigate with error handling. Returns True if page reached."""
+        try:
+            await self.page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            except PWTimeout:
+                pass  # networkidle is best-effort
+            return True
+        except PWTimeout:
+            # Even on timeout, check current URL
+            try:
+                if url.rstrip("/") in self.page.url.rstrip("/"):
+                    return True
+            except Exception:
+                pass
+            return False
+        except Exception:
+            return False
+
     async def start(self):
         self._pw = await async_playwright().start()
-
-        # Persistent profile for session cookies and anti-detection
         profile = os.path.join(SESSION_DIR, "chromium-profile")
         os.makedirs(profile, exist_ok=True)
 
@@ -146,7 +163,6 @@ class DeepSeekCLI:
         pages = ctx.pages
         self.page = pages[0] if pages else await ctx.new_page()
 
-        # Strip automation flags
         await self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             window.chrome = { runtime: {} };
@@ -169,42 +185,60 @@ class DeepSeekCLI:
         token = session.get("token", "")
 
         if token:
-            if await self._inject_token(token):
-                return True
+            try:
+                if await self._inject_token(token):
+                    return True
+            except Exception as e:
+                pprint(f"[WARN] Session injection failed: {e}")
             clear_session()
 
         if not self.cfg.email or not self.cfg.password:
             pprint("[ERROR] No saved session. Login with: -e EMAIL -p PASSWORD")
             return False
 
-        if await self._do_login():
-            try:
-                tok = await self.page.evaluate("() => localStorage.getItem('userToken') || ''")
-                if tok:
-                    save_session(tok, self.cfg.email)
-                    pprint("[AUTH] Session saved")
-            except Exception:
-                pass
-            return True
+        try:
+            if await self._do_login():
+                try:
+                    tok = await self.page.evaluate("() => localStorage.getItem('userToken') || ''")
+                    if tok:
+                        save_session(tok, self.cfg.email)
+                        pprint("[AUTH] Session saved")
+                except Exception:
+                    pass
+                return True
+        except Exception as e:
+            pprint(f"[ERROR] Login exception: {e}")
         return False
 
     async def _inject_token(self, token: str) -> bool:
-        await self.page.goto(self.BASE_URL)
-        await self.page.wait_for_load_state("networkidle")
+        pprint("[AUTH] Trying saved session...")
+        if not await self._safe_goto(self.BASE_URL, timeout=25_000):
+            pprint("[AUTH] Page load timed out")
+            return False
         await asyncio.sleep(3)
-        await self.page.evaluate(f"() => {{ localStorage.setItem('userToken', '{token}'); }}")
-        await self.page.goto(self.BASE_URL)
-        await self.page.wait_for_load_state("networkidle")
+
+        try:
+            await self.page.evaluate(f"() => {{ localStorage.setItem('userToken', '{token}'); }}")
+        except Exception:
+            return False
+
+        if not await self._safe_goto(self.BASE_URL, timeout=25_000):
+            return False
         await asyncio.sleep(3)
-        return await self.page.query_selector(self.SEL_TEXTAREA) is not None
+
+        try:
+            return await self.page.query_selector(self.SEL_TEXTAREA) is not None
+        except Exception:
+            return False
 
     async def _do_login(self) -> bool:
         pprint("[LOGIN] Opening sign-in page...")
-        await self.page.goto(f"{self.BASE_URL}/sign_in")
-        await self.page.wait_for_load_state("networkidle")
+        if not await self._safe_goto(f"{self.BASE_URL}/sign_in", timeout=30_000):
+            pprint("[ERROR] Sign-in page load timed out")
+            return False
         await asyncio.sleep(5)
 
-        # Step 1: Find password input
+        # Find password input
         pw = None
         for sel in ('input[type="password"]', 'input[type="password"].ds-input__input'):
             try:
@@ -213,7 +247,6 @@ class DeepSeekCLI:
             except Exception:
                 continue
 
-        # Toggle if needed
         if pw is None:
             for btn in await self.page.query_selector_all(self.SEL_SOCIAL_BTNS):
                 try:
@@ -232,7 +265,6 @@ class DeepSeekCLI:
             pprint("[ERROR] Password input not found")
             return False
 
-        # Step 2: Find email input
         email = await self.page.query_selector('input[type="text"]') or \
                 await self.page.query_selector('input[type="email"]')
         if email is None:
@@ -242,7 +274,6 @@ class DeepSeekCLI:
         await email.fill(self.cfg.email)
         await pw.fill(self.cfg.password)
 
-        # Step 3: Submit
         btn = await self.page.query_selector(self.SEL_LOGIN_BTN) or \
               await self.page.query_selector('button[type="submit"]')
         if btn is None:
@@ -253,11 +284,17 @@ class DeepSeekCLI:
         except Exception:
             await btn.evaluate("el => el.click()")
 
+        pprint("[LOGIN] Authenticating...")
+
+        # Wait for redirect (best-effort)
         try:
-            await self.page.wait_for_url("https://chat.deepseek.com/", timeout=25000)
+            await self.page.wait_for_url("https://chat.deepseek.com/", timeout=25_000)
         except Exception:
             pass
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
         await asyncio.sleep(3)
 
         url = self.page.url
@@ -278,19 +315,22 @@ class DeepSeekCLI:
             await self.toggle_search()
 
     async def set_mode(self, mode: str):
-        modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
-        if len(modes) < 2:
-            return
-        cls = await modes[0].get_attribute("class") or ""
-        is_instant = "_31a22b0" in cls
-        if mode == "expert" and is_instant:
-            await modes[1].click()
-            await asyncio.sleep(0.5)
-            pprint("[MODE] Expert")
-        elif mode == "default" and not is_instant:
-            await modes[0].click()
-            await asyncio.sleep(0.5)
-            pprint("[MODE] Instant")
+        try:
+            modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
+            if len(modes) < 2:
+                return
+            cls = await modes[0].get_attribute("class") or ""
+            is_instant = "_31a22b0" in cls
+            if mode == "expert" and is_instant:
+                await modes[1].click()
+                await asyncio.sleep(0.5)
+                pprint("[MODE] Expert")
+            elif mode == "default" and not is_instant:
+                await modes[0].click()
+                await asyncio.sleep(0.5)
+                pprint("[MODE] Instant")
+        except Exception:
+            pass
 
     async def toggle_deepthink(self) -> bool:
         return await self._toggle(0, "DeepThink")
@@ -299,54 +339,87 @@ class DeepSeekCLI:
         return await self._toggle(1, "Search")
 
     async def _toggle(self, idx: int, name: str) -> bool:
-        toggles = await self.page.query_selector_all(self.SEL_TOGGLE)
-        if idx >= len(toggles):
+        try:
+            toggles = await self.page.query_selector_all(self.SEL_TOGGLE)
+            if idx >= len(toggles):
+                return False
+            await toggles[idx].click()
+            await asyncio.sleep(0.5)
+            state = await self._toggle_state(idx)
+            pprint(f"[TOGGLE] {name} -> {'ON' if state else 'OFF'}")
+            return state
+        except Exception:
             return False
-        await toggles[idx].click()
-        await asyncio.sleep(0.5)
-        state = await self._toggle_state(idx)
-        pprint(f"[TOGGLE] {name} -> {'ON' if state else 'OFF'}")
-        return state
 
     async def _toggle_state(self, idx: int) -> bool:
-        toggles = await self.page.query_selector_all(self.SEL_TOGGLE)
-        if idx >= len(toggles):
+        try:
+            toggles = await self.page.query_selector_all(self.SEL_TOGGLE)
+            if idx >= len(toggles):
+                return False
+            cls = await toggles[idx].get_attribute("class") or ""
+            return self.SEL_TOGGLE_SELECTED in cls
+        except Exception:
             return False
-        cls = await toggles[idx].get_attribute("class") or ""
-        return self.SEL_TOGGLE_SELECTED in cls
 
     async def state(self) -> Dict[str, Any]:
-        modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
-        mode = "unknown"
-        if len(modes) >= 2:
-            cls = await modes[0].get_attribute("class") or ""
-            mode = "default" if "_31a22b0" in cls else "expert"
-        return {
-            "mode": mode,
-            "deepthink": await self._toggle_state(0),
-            "search": await self._toggle_state(1),
-            "chat_id": self.chat_id,
-            "url": self.page.url,
-        }
+        try:
+            # Method 1: Mode toggle buttons (visible on new chats)
+            modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
+            mode = "unknown"
+            if len(modes) >= 2:
+                cls = await modes[0].get_attribute("class") or ""
+                mode = "default" if "_31a22b0" in cls else "expert"
+
+            # Method 2: Model indicator icon+span (visible on all chats)
+            # Structure: <div><div class="ds-icon ...">...</div><span>Instant</span></div>
+            if mode == "unknown":
+                for icon in await self.page.query_selector_all(".ds-icon"):
+                    try:
+                        # Get next sibling span
+                        span = await icon.evaluate_handle("el => el.nextElementSibling")
+                        if span:
+                            text = (await span.inner_text()).strip()
+                            if text in ("Instant", "快速"):
+                                mode = "default"
+                                break
+                            elif text in ("Expert", "专家"):
+                                mode = "expert"
+                                break
+                    except Exception:
+                        continue
+
+            return {
+                "mode": mode,
+                "deepthink": await self._toggle_state(0),
+                "search": await self._toggle_state(1),
+                "chat_id": self.chat_id,
+                "url": self.page.url,
+            }
+        except Exception:
+            return {"mode": "unknown", "deepthink": False, "search": False, "chat_id": "", "url": ""}
 
     # ------------------------------------------------------------------
     # Chat operations
     # ------------------------------------------------------------------
     async def new_chat(self):
-        el = await self.page.query_selector(self.SEL_NEW_CHAT)
-        if el:
-            await el.click()
-        else:
-            await self.page.goto(self.BASE_URL)
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            el = await self.page.query_selector(self.SEL_NEW_CHAT)
+            if el:
+                await el.click()
+            else:
+                await self._safe_goto(self.BASE_URL)
+            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+        except Exception:
+            pass
         await asyncio.sleep(2)
         self.chat_id = ""
         await self.apply_settings()
         pprint("[CHAT] Ready!")
 
     async def open_chat(self, cid: str) -> bool:
-        await self.page.goto(f"{self.BASE_URL}/a/chat/s/{cid}")
-        await self.page.wait_for_load_state("networkidle")
+        ok = await self._safe_goto(f"{self.BASE_URL}/a/chat/s/{cid}", timeout=20_000)
+        if not ok:
+            return False
         await asyncio.sleep(2)
         if cid in self.page.url:
             self.chat_id = cid
@@ -354,21 +427,27 @@ class DeepSeekCLI:
         return False
 
     async def list_chats(self) -> List[Dict[str, str]]:
-        links = await self.page.query_selector_all('a[href*="/chat/s/"]')
+        try:
+            links = await self.page.query_selector_all('a[href*="/chat/s/"]')
+        except Exception:
+            return []
         out: List[Dict[str, str]] = []
         seen = set()
         for link in links:
-            href = await link.get_attribute("href")
-            if not href or "/chat/s/" not in href:
+            try:
+                href = await link.get_attribute("href")
+                if not href or "/chat/s/" not in href:
+                    continue
+                cid = href.split("/chat/s/")[-1].split("/")[0]
+                if len(cid) < 30 or cid in seen:
+                    continue
+                title = (await link.inner_text()).strip().split("\n")[0].strip()
+                if title in ("", "Today", "7 Days", "30 Days"):
+                    continue
+                seen.add(cid)
+                out.append({"id": cid, "title": title})
+            except Exception:
                 continue
-            cid = href.split("/chat/s/")[-1].split("/")[0]
-            if len(cid) < 30 or cid in seen:
-                continue
-            title = (await link.inner_text()).strip().split("\n")[0].strip()
-            if title in ("", "Today", "7 Days", "30 Days"):
-                continue
-            seen.add(cid)
-            out.append({"id": cid, "title": title})
         return out
 
     # ------------------------------------------------------------------
@@ -380,13 +459,16 @@ class DeepSeekCLI:
         if file_path:
             if not await self._attach(file_path):
                 return {"ok": False, "error": f"Attach failed: {file_path}"}
-        ta = await self.page.query_selector(self.SEL_TEXTAREA)
-        if ta is None:
-            return {"ok": False, "error": "Textarea not found"}
-        await ta.fill(text)
-        await asyncio.sleep(0.5)
-        await ta.press("Enter")
-        return await self._recv()
+        try:
+            ta = await self.page.query_selector(self.SEL_TEXTAREA)
+            if ta is None:
+                return {"ok": False, "error": "Textarea not found"}
+            await ta.fill(text)
+            await asyncio.sleep(0.5)
+            await ta.press("Enter")
+            return await self._recv()
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
     async def _attach(self, path: str) -> bool:
         if not os.path.exists(path):
@@ -410,62 +492,123 @@ class DeepSeekCLI:
             return False
 
     async def _recv(self, timeout: int = 60) -> Dict[str, Any]:
+        """Wait for the AI response. Handles streaming, DeepThink, and Search."""
         start = time.time()
-        last = ""
+        last_resp = ""
+        last_count = 0
         stable = 0
-        has_content = False
+
+        # CRITICAL: Count how many markdown blocks exist BEFORE we start waiting.
+        # Old blocks from previous messages stay in the DOM. We only want NEW ones.
+        try:
+            initial_count = await self.page.evaluate(
+                "() => document.querySelectorAll('.ds-markdown').length"
+            )
+        except Exception:
+            initial_count = 0
 
         while time.time() - start < timeout:
             await asyncio.sleep(1)
 
-            result = await self.page.evaluate(
-                """() => {
-                    let r = "", t = "";
-                    const md = document.querySelectorAll(".ds-markdown");
-                    if (md.length) {
-                        let longest = "";
+            try:
+                result = await self.page.evaluate(
+                    """() => {
+                        const md = document.querySelectorAll(".ds-markdown");
+                        const texts = [];
                         for (const m of md) {
-                            const text = m.textContent.trim();
-                            if (text.length > longest.length) longest = text;
+                            const t = m.textContent.trim();
+                            if (t) texts.push(t);
                         }
-                        r = longest;
-                    }
-                    const th = document.querySelectorAll(".ds-think-content");
-                    if (th.length) t = th[th.length - 1].textContent.trim();
-                    return { r, t };
-                }"""
-            )
-
-            resp = result.get("r", "")
-            thinking = result.get("t", "")
-
-            if resp:
-                has_content = True
-            if not has_content:
+                        const th = document.querySelectorAll(".ds-think-content");
+                        const parts = [];
+                        for (const el of th) {
+                            const t = el.textContent.trim();
+                            if (t) parts.push(t);
+                        }
+                        return { texts, count: md.length, thinking: parts.join("\\n") };
+                    }"""
+                )
+            except Exception:
                 continue
-            if resp != last:
-                last = resp
+
+            texts = result.get("texts", [])
+            count = result.get("count", 0)
+            thinking = result.get("thinking", "")
+
+            # Slice to only NEW blocks (after initial_count)
+            # This prevents picking up old responses from previous messages
+            new_texts = texts[initial_count:] if len(texts) > initial_count else texts
+
+            if not new_texts:
+                continue
+
+            resp = self._pick_best_block(new_texts, thinking)
+
+            if resp != last_resp or count != last_count:
+                last_resp = resp
+                last_count = count
                 stable = 0
                 continue
 
             stable += 1
             if stable >= 3:
                 await asyncio.sleep(1)
-                final = await self.page.evaluate(
-                    """() => {
-                        const md = document.querySelectorAll(".ds-markdown");
-                        if (!md.length) return "";
-                        let longest = "";
-                        for (const m of md) {
-                            const text = m.textContent.trim();
-                            if (text.length > longest.length) longest = text;
-                        }
-                        return longest;
-                    }"""
-                )
-                return {"ok": True, "response": final or resp, "thinking": thinking}
+                try:
+                    final = await self.page.evaluate(
+                        """() => {
+                            const md = document.querySelectorAll(".ds-markdown");
+                            const texts = [];
+                            for (const m of md) {
+                                const t = m.textContent.trim();
+                                if (t) texts.push(t);
+                            }
+                            const th = document.querySelectorAll(".ds-think-content");
+                            const parts = [];
+                            for (const el of th) {
+                                const t = el.textContent.trim();
+                                if (t) parts.push(t);
+                            }
+                            return { texts, thinking: parts.join("\\n") };
+                        }"""
+                    )
+                    final_texts = final.get("texts", [])
+                    final_new = final_texts[initial_count:] if len(final_texts) > initial_count else final_texts
+                    return {
+                        "ok": True,
+                        "response": self._pick_best_block(final_new, final.get("thinking", "")) or resp,
+                        "thinking": final.get("thinking", thinking),
+                    }
+                except Exception:
+                    return {"ok": True, "response": resp, "thinking": thinking}
 
-        return {"ok": False, "error": "Timeout", "response": last}
+        return {"ok": False, "error": "Timeout", "response": last_resp}
+
+    def _pick_best_block(self, texts: List[str], thinking: str = "") -> str:
+        """Filter out planning/thinking blocks, return the best answer block."""
+        if not texts:
+            return ""
+        planning_phrases = (
+            "i need to search", "i will search", "i should search",
+            "i need to look", "i will look", "let me search",
+            "the user is asking", "i need to provide",
+            "i will provide", "i need to find", "let me look",
+            "i'll search", "i need to check", "i will check",
+            "the search results show", "i need to open",
+        )
+        candidates = []
+        think_lower = thinking.lower()
+        for t in texts:
+            lower = t.lower()
+            if len(t) < 15:
+                continue
+            if any(p in lower for p in planning_phrases):
+                continue
+            if think_lower and (lower in think_lower or think_lower in lower):
+                continue
+            candidates.append(t)
+        if candidates:
+            return max(candidates, key=len)
+        return texts[-1] if texts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -496,14 +639,17 @@ def clear_screen():
 
 
 async def draw_header_once(cli: DeepSeekCLI, cfg: Cfg):
-    st = await cli.state()
-    mode = st.get("mode", cfg.model_type).upper()
-    cid = cli.chat_id[:16] if cli.chat_id else "New Chat"
-    dt = "ON" if st.get("deepthink", cfg.thinking) else "OFF"
-    se = "ON" if st.get("search", cfg.search) else "OFF"
-    hdr = f"[bold white]Mode:[/bold white] {mode:7}  [bold white]Chat:[/bold white] {cid:20}  |  [bold white]Think:[/bold white] {dt:3}  |  [bold white]Search:[/bold white] {se:3}"
-    console.rule(hdr, style="blue")
-    pprint()
+    try:
+        st = await cli.state()
+        mode = st.get("mode", cfg.model_type).upper()
+        cid = cli.chat_id[:16] if cli.chat_id else "New Chat"
+        dt = "ON" if st.get("deepthink", cfg.thinking) else "OFF"
+        se = "ON" if st.get("search", cfg.search) else "OFF"
+        hdr = f"[bold white]Mode:[/bold white] {mode:7}  [bold white]Chat:[/bold white] {cid:20}  |  [bold white]Think:[/bold white] {dt:3}  |  [bold white]Search:[/bold white] {se:3}"
+        console.rule(hdr, style="blue")
+        pprint()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +669,6 @@ async def interactive(cli: DeepSeekCLI, cfg: Cfg):
         if not user:
             continue
 
-        # --- Slash commands ---
         if user == "/quit":
             break
         if user in ("/?", "/help"):
@@ -540,11 +685,14 @@ async def interactive(cli: DeepSeekCLI, cfg: Cfg):
             pprint("    /quit             Exit\n")
             continue
         if user == "/new":
-            await cli.new_chat()
-            pending_file = None
-            clear_screen()
-            await draw_header_once(cli, cfg)
-            console.print("\n  [bold]New chat[/bold]\n")
+            try:
+                await cli.new_chat()
+                pending_file = None
+                clear_screen()
+                await draw_header_once(cli, cfg)
+                console.print("\n  [bold]New chat[/bold]\n")
+            except Exception as e:
+                pprint(f"  [ERROR] {e}\n")
             continue
         if user == "/clean":
             clear_screen()
@@ -552,29 +700,41 @@ async def interactive(cli: DeepSeekCLI, cfg: Cfg):
             console.print("\n  [bold]Cleared[/bold]\n")
             continue
         if user == "/think":
-            s = await cli.toggle_deepthink()
-            pprint(f"  DeepThink: {'ON' if s else 'OFF'}\n")
+            try:
+                s = await cli.toggle_deepthink()
+                pprint(f"  DeepThink: {'ON' if s else 'OFF'}\n")
+            except Exception as e:
+                pprint(f"  [ERROR] {e}\n")
             continue
         if user == "/search":
-            s = await cli.toggle_search()
-            pprint(f"  Search: {'ON' if s else 'OFF'}\n")
+            try:
+                s = await cli.toggle_search()
+                pprint(f"  Search: {'ON' if s else 'OFF'}\n")
+            except Exception as e:
+                pprint(f"  [ERROR] {e}\n")
             continue
         if user == "/mode":
             cfg.model_type = "expert" if cfg.model_type == "default" else "default"
             pprint(f"  Mode: {cfg.model_type.upper()} (next /new)\n")
             continue
         if user == "/list":
-            print_chats(await cli.list_chats())
+            try:
+                print_chats(await cli.list_chats())
+            except Exception as e:
+                pprint(f"  [ERROR] {e}\n")
             continue
         if user.startswith("/open "):
             cid = user[6:].strip()
-            if await cli.open_chat(cid):
-                pending_file = None
-                clear_screen()
-                await draw_header_once(cli, cfg)
-                console.print(f"\n  [bold]Chat {cid[:16]}[/bold]\n")
-            else:
-                pprint(f"  [ERROR] Could not open {cid}\n")
+            try:
+                if await cli.open_chat(cid):
+                    pending_file = None
+                    clear_screen()
+                    await draw_header_once(cli, cfg)
+                    console.print(f"\n  [bold]Chat {cid[:16]}[/bold]\n")
+                else:
+                    pprint(f"  [ERROR] Could not open {cid}\n")
+            except Exception as e:
+                pprint(f"  [ERROR] {e}\n")
             continue
         if user.startswith("/file "):
             p = user[6:].strip().strip('"\'')
@@ -589,18 +749,20 @@ async def interactive(cli: DeepSeekCLI, cfg: Cfg):
             pprint("  Unknown command. Type /? for help.\n")
             continue
 
-        # --- Send message ---
-        result = await cli.send(user, pending_file)
-        pending_file = None
-
-        if result.get("ok"):
-            if result.get("thinking"):
-                console.print(Panel(result["thinking"], title="DeepThink", border_style="yellow"))
-            if result.get("response"):
-                console.print(Panel(Markdown(result["response"]), title="DeepSeek", border_style="green"))
-        else:
-            pprint(f"[ERROR] {result.get('error', 'Failed')}")
-        pprint()
+        # Send message
+        try:
+            result = await cli.send(user, pending_file)
+            pending_file = None
+            if result.get("ok"):
+                if result.get("thinking"):
+                    console.print(Panel(result["thinking"], title="DeepThink", border_style="yellow"))
+                if result.get("response"):
+                    console.print(Panel(Markdown(result["response"]), title="DeepSeek", border_style="green"))
+            else:
+                pprint(f"[ERROR] {result.get('error', 'Failed')}")
+            pprint()
+        except Exception as e:
+            pprint(f"[ERROR] {e}\n")
 
     pprint("Goodbye!")
 
@@ -636,7 +798,12 @@ async def _run(args) -> int:
         search=args.search,
     )
     cli = DeepSeekCLI(cfg)
-    await cli.start()
+
+    try:
+        await cli.start()
+    except Exception as e:
+        pprint(f"[ERROR] Browser failed to start: {e}")
+        return 1
 
     try:
         if not await cli.ensure_logged_in():
