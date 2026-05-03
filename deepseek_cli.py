@@ -1,18 +1,4 @@
 #!/usr/bin/env python3
-"""
-deepseek-cli
-~~~~~~~~~~~~
-
-Headless CLI for DeepSeek Chat (chat.deepseek.com).
-
-  TUI mode:      deepseek-cli -n
-  Script mode:   deepseek-cli --headless -m "What is 2+2?"
-
-Install: pip install playwright rich nest_asyncio && playwright install chromium
-
-Repo:    https://github.com/YOURNAME/deepseek-cli
-License: MIT
-"""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +9,7 @@ import platform
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 if platform.system() == "Windows":
     import nest_asyncio
@@ -88,6 +74,252 @@ class Cfg:
     model_type: str = "default"
     thinking: bool = False
     search: bool = False
+    debug: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Self-Healing Element Finder
+# ---------------------------------------------------------------------------
+class SmartFinder:
+    """Finds DOM elements using multiple fallback strategies.
+    When UI changes, only the broken strategy needs updating.
+    """
+
+    def __init__(self, page: Page):
+        self.page = page
+        self.log: List[Tuple[str, str, bool]] = []  # (name, strategy, success)
+
+    async def find(self, name: str, strategies: List[Tuple[str, str]], timeout: int = 3000) -> Optional[Any]:
+        """Try strategies until one works. Returns the element or None."""
+        for strategy_name, selector in strategies:
+            try:
+                # For text-based selectors (has-text, xpath contains)
+                if selector.startswith("xpath="):
+                    el = await self.page.query_selector(selector)
+                elif ":has-text(" in selector or ":has(" in selector:
+                    el = await self.page.query_selector(selector)
+                else:
+                    el = await self.page.query_selector(selector)
+
+                if el is not None:
+                    visible = await el.is_visible()
+                    if visible:
+                        self.log.append((name, strategy_name, True))
+                        return el
+                    else:
+                        self.log.append((name, f"{strategy_name} (hidden)", False))
+                else:
+                    self.log.append((name, strategy_name, False))
+            except Exception as e:
+                self.log.append((name, f"{strategy_name} ({e.__class__.__name__})", False))
+                continue
+
+        # All strategies failed
+        return None
+
+    async def find_email_input(self) -> Optional[Any]:
+        """Find email/username input field."""
+        el = await self.find("email_input", [
+            ('type=email', 'input[type="email"]'),
+            ('type=text', 'input[type="text"]'),
+            ('placeholder email', 'input[placeholder*="mail" i]'),
+            ('placeholder username', 'input[placeholder*="user" i]'),
+            ('first text input', 'input[type="text"]:visible'),
+            ('any email-like', 'input[type="email"], input[type="text"]'),
+        ])
+        if el:
+            return el
+        # Fallback: first visible text input in top half of page
+        return await self._find_input_by_position("text")
+
+    async def find_password_input(self) -> Optional[Any]:
+        """Find password input field."""
+        el = await self.find("password_input", [
+            ('type=password', 'input[type="password"]'),
+            ('password class', 'input[type="password"].ds-input__input'),
+            ('placeholder password', 'input[type="password"][placeholder*="pass" i]'),
+            ('any password', 'input[type="password"]:visible'),
+        ])
+        if el:
+            return el
+        # Fallback: first visible password input anywhere
+        return await self._find_input_by_position("password")
+
+    async def _find_input_by_position(self, input_type: str) -> Optional[Any]:
+        """Auto-discover input by position and type."""
+        try:
+            if input_type == "password":
+                candidates = await self.page.query_selector_all('input[type="password"]:visible')
+            else:
+                candidates = await self.page.query_selector_all('input[type="text"]:visible, input[type="email"]:visible')
+            if not candidates:
+                return None
+            best = None
+            best_y = float('inf')
+            for c in candidates:
+                box = await c.bounding_box()
+                if box and box["y"] < best_y:
+                    best_y = box["y"]
+                    best = c
+            if best:
+                self.log.append((f"{input_type}_input_auto", f"position-based (y={best_y:.0f})", True))
+            return best
+        except Exception:
+            return None
+
+    async def find_login_button(self) -> Optional[Any]:
+        """Find login/submit button."""
+        el = await self.find("login_button", [
+            ('text Log in', 'button:has-text("Log in")'),
+            ('text 登录', 'button:has-text("登录")'),
+            ('primary class', '.ds-basic-button--primary'),
+            ('submit type', 'button[type="submit"]'),
+            ('login class', 'button[class*="login" i]'),
+            ('first button in form', 'form button'),
+        ])
+        if el:
+            return el
+        # Fallback: first visible button in bottom half of viewport
+        return await self._find_button_by_position()
+
+    async def _find_button_by_position(self) -> Optional[Any]:
+        """Auto-discover a submit/login button by position."""
+        try:
+            buttons = await self.page.query_selector_all('button:visible')
+            if not buttons:
+                return None
+            vp = await self.page.viewport_size()
+            vph = vp.get("height", 900) if vp else 900
+            mid_y = vph * 0.4
+            best = None
+            best_y = 0
+            for b in buttons:
+                box = await b.bounding_box()
+                if not box:
+                    continue
+                # Prefer buttons in bottom half, relatively wide (not tiny icons)
+                if box["y"] > mid_y and box["width"] > 60:
+                    if box["y"] > best_y:
+                        best_y = box["y"]
+                        best = b
+            if best:
+                self.log.append(("login_button_auto", f"position-based (y={best_y:.0f}, w>60)", True))
+            return best
+        except Exception:
+            return None
+
+    async def find_textarea(self) -> Optional[Any]:
+        """Find chat message input."""
+        # Strategy 1: Predefined selectors (fast)
+        el = await self.find("textarea", [
+            ('tag textarea', 'textarea'),
+            ('role textbox', 'textarea[role="textbox"]'),
+            ('placeholder message', 'textarea[placeholder*="message" i]'),
+            ('placeholder send', 'textarea[placeholder*="send" i]'),
+            ('class input', '.ds-input__textarea'),
+        ])
+        if el:
+            return el
+        # Strategy 2: Position-based auto-discovery
+        return await self._find_by_position("textarea")
+
+    async def _find_by_position(self, tag: str) -> Optional[Any]:
+        """Auto-discover element by position (bottom of page)."""
+        try:
+            candidates = await self.page.query_selector_all(f"{tag}:visible")
+            if not candidates:
+                return None
+            best = None
+            best_y = 0
+            for c in candidates:
+                box = await c.bounding_box()
+                if box and box["y"] > best_y:
+                    best_y = box["y"]
+                    best = c
+            if best:
+                self.log.append((f"{tag}_auto", f"position-based (y={best_y:.0f})", True))
+            return best
+        except Exception:
+            return None
+
+    async def _find_link_by_position(self) -> Optional[Any]:
+        """Auto-discover a New Chat link in left sidebar area."""
+        try:
+            links = await self.page.query_selector_all('a:visible')
+            if not links:
+                return None
+            vp = await self.page.viewport_size()
+            vpw = vp.get("width", 1280) if vp else 1280
+            mid_x = vpw * 0.35
+            best = None
+            best_y = float('inf')
+            for a in links:
+                box = await a.bounding_box()
+                if not box:
+                    continue
+                # Sidebar links are in left 35% of screen, near top
+                if box["x"] < mid_x and box["y"] < 200 and box["width"] > 40:
+                    if box["y"] < best_y:
+                        best_y = box["y"]
+                        best = a
+            if best:
+                self.log.append(("new_chat_auto", f"position-based (x<{mid_x:.0f}, y={best_y:.0f})", True))
+            return best
+        except Exception:
+            return None
+
+    async def find_new_chat_button(self) -> Optional[Any]:
+        """Find New Chat button/link."""
+        el = await self.find("new_chat", [
+            ('href /', 'a[href="/"]'),
+            ('text New Chat', 'a:has-text("New Chat")'),
+            ('text New chat', 'a:has-text("New chat")'),
+            ('text 开启新对话', 'a:has-text("开启新对话")'),
+            ('sidebar link', 'aside a, nav a'),
+        ])
+        if el:
+            return el
+        # Fallback: first visible link in left sidebar area
+        return await self._find_link_by_position()
+
+    async def find_mode_indicator(self) -> Optional[str]:
+        """Find current mode text (Instant/Expert). Returns text, not element."""
+        for strategy_name, selector in [
+            ('icon sibling', '.ds-icon + span'),
+            ('model badge', '[class*="model"] span, [class*="mode"] span'),
+            ('text Expert', 'text=/Expert/'),
+            ('text Instant', 'text=/Instant/'),
+            ('button Expert', 'button:has-text("Expert")'),
+            ('button Instant', 'button:has-text("Instant")'),
+        ]:
+            try:
+                el = await self.page.query_selector(selector)
+                if el:
+                    text = (await el.inner_text()).strip()
+                    if text in ("Instant", "Expert", "快速", "专家"):
+                        self.log.append(("mode_indicator", strategy_name, True))
+                        return text
+            except Exception:
+                continue
+        return None
+
+    async def find_toggle(self, label_text: str) -> Optional[Any]:
+        """Find a toggle button by its label."""
+        strategies = [
+            (f'text {label_text}', f'.ds-toggle-button:has-text("{label_text}")'),
+            (f'contains {label_text}', f'*:has-text("{label_text}"):has(.ds-toggle-button)'),
+            (f'xpath {label_text}', f'xpath=//*[contains(text(), "{label_text}")]/ancestor::button'),
+        ]
+        return await self.find(f"toggle_{label_text}", strategies)
+
+    def report(self) -> str:
+        """Generate a debug report of what worked/failed."""
+        lines = ["\n--- SmartFinder Report ---"]
+        for name, strategy, success in self.log:
+            status = "OK" if success else "FAIL"
+            lines.append(f"  [{status}] {name}: {strategy}")
+        lines.append("---")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -96,16 +328,13 @@ class Cfg:
 class DeepSeekCLI:
     BASE_URL = "https://chat.deepseek.com"
 
-    # Login page
+    # Legacy selectors kept for fast-path checks
     SEL_SOCIAL_BTNS = ".ds-sign-in-form__social-button"
     SEL_LOGIN_BTN = ".ds-basic-button--primary"
-
-    # Chat page
     SEL_NEW_CHAT = 'a[href="/"]'
     SEL_TEXTAREA = "textarea"
     SEL_TOGGLE = ".ds-toggle-button"
     SEL_TOGGLE_SELECTED = "ds-toggle-button--selected"
-    SEL_MODE_INSTANT = "div[class*='_9f2341b'][class*='_7ac2123']"
 
     def __init__(self, cfg: Cfg):
         self.cfg = cfg
@@ -113,19 +342,18 @@ class DeepSeekCLI:
         self.page: Optional[Page] = None
         self.chat_id: str = ""
         self._pw = None
+        self.finder: Optional[SmartFinder] = None
 
-    # -- Safe navigation: catches timeouts and all Playwright errors --
+    # -- Safe navigation --
     async def _safe_goto(self, url: str, timeout: int = 30_000) -> bool:
-        """Navigate with error handling. Returns True if page reached."""
         try:
             await self.page.goto(url, timeout=timeout, wait_until="domcontentloaded")
             try:
                 await self.page.wait_for_load_state("networkidle", timeout=15_000)
             except PWTimeout:
-                pass  # networkidle is best-effort
+                pass
             return True
         except PWTimeout:
-            # Even on timeout, check current URL
             try:
                 if url.rstrip("/") in self.page.url.rstrip("/"):
                     return True
@@ -162,6 +390,7 @@ class DeepSeekCLI:
         self.context = ctx
         pages = ctx.pages
         self.page = pages[0] if pages else await ctx.new_page()
+        self.finder = SmartFinder(self.page)
 
         await self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -174,6 +403,27 @@ class DeepSeekCLI:
                 await self.context.close()
             if self._pw:
                 await self._pw.stop()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Debug helpers
+    # ------------------------------------------------------------------
+    async def _diagnose(self, reason: str):
+        """Save screenshot + DOM when something breaks."""
+        ts = int(time.time())
+        ss = os.path.join(SESSION_DIR, f"debug-{ts}.png")
+        dom = os.path.join(SESSION_DIR, f"debug-{ts}.html")
+        try:
+            await self.page.screenshot(path=ss, full_page=True)
+            html = await self.page.content()
+            with open(dom, "w", encoding="utf-8") as f:
+                f.write(html[:100000])
+            pprint(f"[DIAGNOSE] {reason}")
+            pprint(f"[DIAGNOSE] Screenshot: {ss}")
+            pprint(f"[DIAGNOSE] DOM dump: {dom}")
+            if self.cfg.debug:
+                pprint(self.finder.report())
         except Exception:
             pass
 
@@ -213,21 +463,18 @@ class DeepSeekCLI:
     async def _inject_token(self, token: str) -> bool:
         pprint("[AUTH] Trying saved session...")
         if not await self._safe_goto(self.BASE_URL, timeout=25_000):
-            pprint("[AUTH] Page load timed out")
             return False
         await asyncio.sleep(3)
-
         try:
             await self.page.evaluate(f"() => {{ localStorage.setItem('userToken', '{token}'); }}")
         except Exception:
             return False
-
         if not await self._safe_goto(self.BASE_URL, timeout=25_000):
             return False
         await asyncio.sleep(3)
-
         try:
-            return await self.page.query_selector(self.SEL_TEXTAREA) is not None
+            ta = await self.finder.find_textarea()
+            return ta is not None
         except Exception:
             return False
 
@@ -238,14 +485,8 @@ class DeepSeekCLI:
             return False
         await asyncio.sleep(5)
 
-        # Find password input
-        pw = None
-        for sel in ('input[type="password"]', 'input[type="password"].ds-input__input'):
-            try:
-                pw = await self.page.wait_for_selector(sel, timeout=5000)
-                break
-            except Exception:
-                continue
+        # Find password input using SmartFinder
+        pw = await self.finder.find_password_input()
 
         if pw is None:
             for btn in await self.page.query_selector_all(self.SEL_SOCIAL_BTNS):
@@ -254,29 +495,27 @@ class DeepSeekCLI:
                 except Exception:
                     pass
                 await asyncio.sleep(2)
-                try:
-                    pw = await self.page.wait_for_selector('input[type="password"]', timeout=5000)
-                except Exception:
-                    pass
+                pw = await self.finder.find_password_input()
                 if pw:
                     break
 
         if pw is None:
-            pprint("[ERROR] Password input not found")
+            await self._diagnose("Password input not found after toggling")
+            pprint("[ERROR] Password input not found. Run with --debug for details.")
             return False
 
-        email = await self.page.query_selector('input[type="text"]') or \
-                await self.page.query_selector('input[type="email"]')
+        email = await self.finder.find_email_input()
         if email is None:
+            await self._diagnose("Email input not found")
             pprint("[ERROR] Email input not found")
             return False
 
         await email.fill(self.cfg.email)
         await pw.fill(self.cfg.password)
 
-        btn = await self.page.query_selector(self.SEL_LOGIN_BTN) or \
-              await self.page.query_selector('button[type="submit"]')
+        btn = await self.finder.find_login_button()
         if btn is None:
+            await self._diagnose("Login button not found")
             pprint("[ERROR] Login button not found")
             return False
         try:
@@ -285,8 +524,6 @@ class DeepSeekCLI:
             await btn.evaluate("el => el.click()")
 
         pprint("[LOGIN] Authenticating...")
-
-        # Wait for redirect (best-effort)
         try:
             await self.page.wait_for_url("https://chat.deepseek.com/", timeout=25_000)
         except Exception:
@@ -315,18 +552,27 @@ class DeepSeekCLI:
             await self.toggle_search()
 
     async def set_mode(self, mode: str):
+        """Switch between Instant and Expert using text-based button detection."""
         try:
-            modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
-            if len(modes) < 2:
+            buttons = await self.page.query_selector_all('button')
+            instant_btn = None
+            expert_btn = None
+            for btn in buttons:
+                text = (await btn.inner_text()).strip()
+                if text in ("Instant", "快速"):
+                    instant_btn = btn
+                elif text in ("Expert", "专家"):
+                    expert_btn = btn
+            if not instant_btn or not expert_btn:
                 return
-            cls = await modes[0].get_attribute("class") or ""
-            is_instant = "_31a22b0" in cls
-            if mode == "expert" and is_instant:
-                await modes[1].click()
+
+            current = await self.finder.find_mode_indicator()
+            if mode == "expert" and current in ("Instant", "快速"):
+                await expert_btn.click()
                 await asyncio.sleep(0.5)
                 pprint("[MODE] Expert")
-            elif mode == "default" and not is_instant:
-                await modes[0].click()
+            elif mode == "default" and current in ("Expert", "专家"):
+                await instant_btn.click()
                 await asyncio.sleep(0.5)
                 pprint("[MODE] Instant")
         except Exception:
@@ -363,30 +609,13 @@ class DeepSeekCLI:
 
     async def state(self) -> Dict[str, Any]:
         try:
-            # Method 1: Mode toggle buttons (visible on new chats)
-            modes = await self.page.query_selector_all(self.SEL_MODE_INSTANT)
+            # Mode from indicator badge (no obfuscated classes)
             mode = "unknown"
-            if len(modes) >= 2:
-                cls = await modes[0].get_attribute("class") or ""
-                mode = "default" if "_31a22b0" in cls else "expert"
-
-            # Method 2: Model indicator icon+span (visible on all chats)
-            # Structure: <div><div class="ds-icon ...">...</div><span>Instant</span></div>
-            if mode == "unknown":
-                for icon in await self.page.query_selector_all(".ds-icon"):
-                    try:
-                        # Get next sibling span
-                        span = await icon.evaluate_handle("el => el.nextElementSibling")
-                        if span:
-                            text = (await span.inner_text()).strip()
-                            if text in ("Instant", "快速"):
-                                mode = "default"
-                                break
-                            elif text in ("Expert", "专家"):
-                                mode = "expert"
-                                break
-                    except Exception:
-                        continue
+            badge = await self.finder.find_mode_indicator()
+            if badge in ("Instant", "快速"):
+                mode = "default"
+            elif badge in ("Expert", "专家"):
+                mode = "expert"
 
             return {
                 "mode": mode,
@@ -403,12 +632,15 @@ class DeepSeekCLI:
     # ------------------------------------------------------------------
     async def new_chat(self):
         try:
-            el = await self.page.query_selector(self.SEL_NEW_CHAT)
+            el = await self.finder.find_new_chat_button()
             if el:
                 await el.click()
             else:
                 await self._safe_goto(self.BASE_URL)
-            await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            try:
+                await self.page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
         except Exception:
             pass
         await asyncio.sleep(2)
@@ -420,8 +652,21 @@ class DeepSeekCLI:
         ok = await self._safe_goto(f"{self.BASE_URL}/a/chat/s/{cid}", timeout=20_000)
         if not ok:
             return False
-        await asyncio.sleep(2)
-        if cid in self.page.url:
+        await asyncio.sleep(3)
+        # DeepSeek uses client-side routing — URL may not contain CID
+        # Check if page actually loaded by finding textarea
+        try:
+            ta = await self.finder.find_textarea()
+            if ta is not None:
+                self.chat_id = cid
+                return True
+        except Exception:
+            pass
+        # Fallback: check if we're still on sign_in
+        if "sign_in" in self.page.url:
+            return False
+        # If URL is chat domain and textarea exists, we're good
+        if "chat.deepseek.com" in self.page.url:
             self.chat_id = cid
             return True
         return False
@@ -460,9 +705,10 @@ class DeepSeekCLI:
             if not await self._attach(file_path):
                 return {"ok": False, "error": f"Attach failed: {file_path}"}
         try:
-            ta = await self.page.query_selector(self.SEL_TEXTAREA)
+            ta = await self.finder.find_textarea()
             if ta is None:
-                return {"ok": False, "error": "Textarea not found"}
+                await self._diagnose("Textarea not found — UI may have changed")
+                return {"ok": False, "error": "Textarea not found. Run with --debug for details."}
             await ta.fill(text)
             await asyncio.sleep(0.5)
             await ta.press("Enter")
@@ -492,14 +738,11 @@ class DeepSeekCLI:
             return False
 
     async def _recv(self, timeout: int = 60) -> Dict[str, Any]:
-        """Wait for the AI response. Handles streaming, DeepThink, and Search."""
         start = time.time()
         last_resp = ""
         last_count = 0
         stable = 0
 
-        # CRITICAL: Count how many markdown blocks exist BEFORE we start waiting.
-        # Old blocks from previous messages stay in the DOM. We only want NEW ones.
         try:
             initial_count = await self.page.evaluate(
                 "() => document.querySelectorAll('.ds-markdown').length"
@@ -534,9 +777,6 @@ class DeepSeekCLI:
             texts = result.get("texts", [])
             count = result.get("count", 0)
             thinking = result.get("thinking", "")
-
-            # Slice to only NEW blocks (after initial_count)
-            # This prevents picking up old responses from previous messages
             new_texts = texts[initial_count:] if len(texts) > initial_count else texts
 
             if not new_texts:
@@ -571,11 +811,11 @@ class DeepSeekCLI:
                             return { texts, thinking: parts.join("\\n") };
                         }"""
                     )
-                    final_texts = final.get("texts", [])
-                    final_new = final_texts[initial_count:] if len(final_texts) > initial_count else final_texts
+                    ft = final.get("texts", [])
+                    fn = ft[initial_count:] if len(ft) > initial_count else ft
                     return {
                         "ok": True,
-                        "response": self._pick_best_block(final_new, final.get("thinking", "")) or resp,
+                        "response": self._pick_best_block(fn, final.get("thinking", "")) or resp,
                         "thinking": final.get("thinking", thinking),
                     }
                 except Exception:
@@ -584,7 +824,6 @@ class DeepSeekCLI:
         return {"ok": False, "error": "Timeout", "response": last_resp}
 
     def _pick_best_block(self, texts: List[str], thinking: str = "") -> str:
-        """Filter out planning/thinking blocks, return the best answer block."""
         if not texts:
             return ""
         planning_phrases = (
@@ -785,6 +1024,8 @@ def build_parser():
     p.add_argument("-f", "--file", help="File to attach (--headless mode)")
     p.add_argument("--show-browser", action="store_true",
                     help="Show the browser window")
+    p.add_argument("--debug", action="store_true",
+                    help="Debug mode: save screenshots + DOM dumps + strategy reports")
     return p
 
 
@@ -796,6 +1037,7 @@ async def _run(args) -> int:
         model_type="expert" if args.expert else "default",
         thinking=args.think,
         search=args.search,
+        debug=args.debug,
     )
     cli = DeepSeekCLI(cfg)
 
@@ -808,6 +1050,12 @@ async def _run(args) -> int:
     try:
         if not await cli.ensure_logged_in():
             return 1
+
+        # Debug mode: dump current page state and exit
+        if cfg.debug:
+            await cli._diagnose("Debug mode requested")
+            pprint("[DEBUG] Inspect the saved files, then update selectors.")
+            return 0
 
         # Raw text mode
         if args.headless:
